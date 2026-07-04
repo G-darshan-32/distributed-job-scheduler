@@ -28,7 +28,8 @@ async function bootstrap() {
   // Background scheduler
   SchedulerService.start();
 
-  server.listen(config.PORT, () => {
+  // Listen on 0.0.0.0 required for Railway/Docker environments
+  server.listen(config.PORT, '0.0.0.0', () => {
     logger.info(`Server running on port ${config.PORT}`, { env: config.NODE_ENV });
     logger.info(`API Docs: http://localhost:${config.PORT}/api-docs`);
   });
