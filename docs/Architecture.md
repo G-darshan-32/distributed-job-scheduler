@@ -1,0 +1,110 @@
+# Architecture
+
+## System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Browser                           │
+│              React SPA (Vite + TailwindCSS)                     │
+│         REST/HTTP  ─────────────────  WebSocket                 │
+└────────────────────────────┬────────────────────┬───────────────┘
+                             │                    │
+                    ┌────────▼────────┐           │
+                    │  Backend API    │◄──────────┘
+                    │  Express/Node   │
+                    │  Port 4000      │
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              │              │              │
+      ┌───────▼──────┐ ┌────▼─────┐ ┌─────▼──────┐
+      │  PostgreSQL  │ │  Redis   │ │ Scheduler  │
+      │  Port 5432   │ │ Port 6379│ │  (in-proc) │
+      └───────▲──────┘ └──────────┘ └─────▲──────┘
+              │                            │
+      ┌───────┴──────────────────────────┐ │
+      │         Worker Pool              │─┘
+      │  Worker-1  Worker-2  Worker-N    │
+      │   Poll → Claim → Execute → Done  │
+      └──────────────────────────────────┘
+```
+
+## Component Diagram
+
+```
+Backend API
+├── Auth Service         JWT issue/verify/refresh/revoke
+├── Org Service          Multi-tenant organization management
+├── Project Service      Project CRUD within orgs
+├── Queue Service        Queue lifecycle + pause/resume + stats
+├── Job Service          Job creation + status transitions
+├── Scheduler Service    Delayed job promotion + cron triggering
+├── Worker Service       Worker registry + heartbeat monitoring
+├── DLQ Service          Dead letter queue + AI summaries + replay
+├── Lock Service         Distributed advisory locks (PostgreSQL)
+└── WebSocket            Real-time broadcast to connected clients
+
+Worker Process
+├── Poll Loop            SELECT FOR UPDATE SKIP LOCKED every 1s
+├── Executor             Runs job logic with timeout enforcement
+├── Heartbeat            Updates worker liveness every 15s
+├── Retry Engine         Calculates backoff delays
+└── Graceful Shutdown    Drains active jobs before exit
+```
+
+## Job Lifecycle
+
+```
+PENDING ──(scheduler claim)──► CLAIMED ──(worker start)──► RUNNING
+   ▲                                                            │
+   │ (retry delay elapsed)                          ┌──────────┼──────────┐
+   │                                           success       failure    timeout
+SCHEDULED ◄──────────────────────────────────────   │           │           │
+   │                                             COMPLETED  (attempt < max) (attempt < max)
+   │ (runAt elapsed, cron fired)                            SCHEDULED      SCHEDULED
+   │                                                              │
+   └──────────────────────────────────────────────────    (attempts exhausted)
+                                                                DEAD ──► DLQ
+                                                     CANCELLED (manual)
+```
+
+## Sequence: Job Dispatch
+
+```
+Client          API             Database         Worker
+  │──POST /jobs──►│                  │              │
+  │               │──INSERT job──────►│              │
+  │               │◄─────────────────│              │
+  │◄─201 created──│                  │              │
+  │               │──WS broadcast────────────────────►│
+  │               │                  │              │
+  │               │                  │◄─POLL query──│
+  │               │                  │──job row─────►│
+  │               │                  │◄─CLAIM UPDATE─│
+  │               │                  │              │──execute──►
+  │               │                  │◄─COMPLETE────│
+  │               │──WS broadcast────────────────────►│
+```
+
+## Deployment Diagram (Docker Compose)
+
+```
+┌─────────────────────────────────────────────┐
+│                Docker Host                   │
+│                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  │
+│  │ frontend │  │ backend  │  │ worker×2 │  │
+│  │ :3000    │  │ :4000    │  │          │  │
+│  │ nginx    │  │ node     │  │ node     │  │
+│  └────┬─────┘  └────┬─────┘  └────┬─────┘  │
+│       │             │              │        │
+│       └─────────────┼──────────────┘        │
+│                     │                       │
+│  ┌──────────────────┼───────────────────┐   │
+│  │ Internal network │                   │   │
+│  │  ┌───────────────┴──┐  ┌──────────┐  │   │
+│  │  │   postgres :5432 │  │redis:6379│  │   │
+│  │  └──────────────────┘  └──────────┘  │   │
+│  └───────────────────────────────────────┘   │
+└─────────────────────────────────────────────┘
+```

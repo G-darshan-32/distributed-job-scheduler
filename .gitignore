@@ -1,0 +1,12 @@
+node_modules/
+dist/
+.env
+*.log
+logs/
+coverage/
+.prisma/
+*.tsbuildinfo
+.DS_Store
+backend/.env
+worker/.env
+frontend/.env

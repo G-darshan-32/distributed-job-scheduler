@@ -1,0 +1,441 @@
+// Prisma Schema - Distributed Job Scheduler
+// Production-level relational schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
+}
+
+enum JobStatus {
+  PENDING
+  SCHEDULED
+  CLAIMED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+  DEAD
+}
+
+enum JobType {
+  IMMEDIATE
+  DELAYED
+  SCHEDULED
+  RECURRING
+  BATCH
+}
+
+enum RetryStrategy {
+  FIXED
+  LINEAR
+  EXPONENTIAL
+}
+
+enum WorkerStatus {
+  ACTIVE
+  IDLE
+  DRAINING
+  OFFLINE
+}
+
+enum ExecutionStatus {
+  STARTED
+  COMPLETED
+  FAILED
+  TIMED_OUT
+}
+
+enum LogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+// ─── Users ────────────────────────────────────────────────────────────────────
+// Purpose: Stores user accounts with hashed credentials.
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  memberships  OrgMembership[]
+  refreshTokens RefreshToken[]
+
+  @@index([email])
+  @@map("users")
+}
+
+// ─── Refresh Tokens ───────────────────────────────────────────────────────────
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([token])
+  @@index([userId])
+  @@map("refresh_tokens")
+}
+
+// ─── Organizations ────────────────────────────────────────────────────────────
+// Purpose: Top-level namespace; multi-tenant isolation boundary.
+
+model Organization {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  memberships OrgMembership[]
+  projects    Project[]
+
+  @@index([slug])
+  @@map("organizations")
+}
+
+// ─── Org Memberships ──────────────────────────────────────────────────────────
+
+model OrgMembership {
+  id             String   @id @default(uuid())
+  userId         String   @map("user_id")
+  organizationId String   @map("organization_id")
+  role           Role     @default(MEMBER)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId])
+  @@index([userId])
+  @@index([organizationId])
+  @@map("org_memberships")
+}
+
+// ─── Projects ─────────────────────────────────────────────────────────────────
+// Purpose: Logical grouping of queues within an org.
+
+model Project {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  name           String
+  slug           String
+  description    String?
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  queues       Queue[]
+
+  @@unique([organizationId, slug])
+  @@index([organizationId])
+  @@map("projects")
+}
+
+// ─── Retry Policies ───────────────────────────────────────────────────────────
+// Purpose: Reusable retry configurations attached to queues.
+
+model RetryPolicy {
+  id           String        @id @default(uuid())
+  name         String
+  strategy     RetryStrategy @default(EXPONENTIAL)
+  maxAttempts  Int           @default(3) @map("max_attempts")
+  baseDelayMs  Int           @default(1000) @map("base_delay_ms")
+  maxDelayMs   Int           @default(3600000) @map("max_delay_ms") // 1 hour cap
+  multiplier   Float         @default(2.0)
+  createdAt    DateTime      @default(now()) @map("created_at")
+  updatedAt    DateTime      @updatedAt @map("updated_at")
+
+  queues Queue[]
+
+  @@map("retry_policies")
+}
+
+// ─── Queues ───────────────────────────────────────────────────────────────────
+// Purpose: Named FIFO/priority queues belonging to a project.
+
+model Queue {
+  id               String   @id @default(uuid())
+  projectId        String   @map("project_id")
+  retryPolicyId    String?  @map("retry_policy_id")
+  name             String
+  slug             String
+  description      String?
+  priority         Int      @default(0)       // higher = more important
+  concurrencyLimit Int      @default(10)      @map("concurrency_limit")
+  isPaused         Boolean  @default(false)   @map("is_paused")
+  isActive         Boolean  @default(true)    @map("is_active")
+  rateLimitPerMin  Int?                        @map("rate_limit_per_min")
+  jobTimeout       Int      @default(300000)  @map("job_timeout_ms")   // 5 min default
+  createdAt        DateTime @default(now())   @map("created_at")
+  updatedAt        DateTime @updatedAt        @map("updated_at")
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  retryPolicy RetryPolicy? @relation(fields: [retryPolicyId], references: [id], onDelete: SetNull)
+  jobs        Job[]
+  shards      QueueShard[]
+
+  @@unique([projectId, slug])
+  @@index([projectId])
+  @@index([isPaused, isActive])
+  @@index([priority])
+  @@map("queues")
+}
+
+// ─── Queue Shards ─────────────────────────────────────────────────────────────
+// Purpose: Horizontal sharding for high-throughput queues.
+
+model QueueShard {
+  id        String   @id @default(uuid())
+  queueId   String   @map("queue_id")
+  shardKey  Int      @map("shard_key")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  queue Queue @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@unique([queueId, shardKey])
+  @@index([queueId])
+  @@map("queue_shards")
+}
+
+// ─── Jobs ─────────────────────────────────────────────────────────────────────
+// Purpose: Core entity. Represents a unit of work to be executed.
+
+model Job {
+  id              String    @id @default(uuid())
+  queueId         String    @map("queue_id")
+  batchId         String?   @map("batch_id")
+  parentJobId     String?   @map("parent_job_id")   // workflow dependencies
+  name            String
+  type            JobType   @default(IMMEDIATE)
+  status          JobStatus @default(PENDING)
+  priority        Int       @default(0)
+  payload         Json      @default("{}")
+  result          Json?
+  idempotencyKey  String?   @unique @map("idempotency_key")
+  
+  // Scheduling
+  runAt           DateTime? @map("run_at")           // delayed/scheduled
+  cronExpression  String?   @map("cron_expression")  // recurring
+  
+  // Attempts
+  attempts        Int       @default(0)
+  maxAttempts     Int       @default(3)              @map("max_attempts")
+  lastError       String?   @map("last_error")
+  
+  // Timing
+  timeout         Int?                               // ms, overrides queue default
+  startedAt       DateTime? @map("started_at")
+  completedAt     DateTime? @map("completed_at")
+  createdAt       DateTime  @default(now())          @map("created_at")
+  updatedAt       DateTime  @updatedAt               @map("updated_at")
+
+  // Worker assignment
+  claimedBy       String?   @map("claimed_by")
+  claimedAt       DateTime? @map("claimed_at")
+
+  queue       Queue          @relation(fields: [queueId], references: [id], onDelete: Cascade)
+  batch       JobBatch?      @relation(fields: [batchId], references: [id], onDelete: SetNull)
+  parentJob   Job?           @relation("JobDependencies", fields: [parentJobId], references: [id], onDelete: SetNull)
+  childJobs   Job[]          @relation("JobDependencies")
+  executions  JobExecution[]
+  logs        JobLog[]
+  dlqEntry    DLQEntry?
+
+  @@index([queueId, status, priority, createdAt])
+  @@index([status])
+  @@index([runAt])
+  @@index([batchId])
+  @@index([claimedBy])
+  @@index([idempotencyKey])
+  @@index([parentJobId])
+  @@map("jobs")
+}
+
+// ─── Job Batches ──────────────────────────────────────────────────────────────
+// Purpose: Groups batch jobs for collective tracking.
+
+model JobBatch {
+  id          String   @id @default(uuid())
+  name        String
+  totalJobs   Int      @default(0)  @map("total_jobs")
+  pendingJobs Int      @default(0)  @map("pending_jobs")
+  doneJobs    Int      @default(0)  @map("done_jobs")
+  failedJobs  Int      @default(0)  @map("failed_jobs")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt      @map("updated_at")
+
+  jobs Job[]
+
+  @@map("job_batches")
+}
+
+// ─── Job Executions ───────────────────────────────────────────────────────────
+// Purpose: Immutable audit log of each execution attempt per job.
+
+model JobExecution {
+  id          String          @id @default(uuid())
+  jobId       String          @map("job_id")
+  workerId    String          @map("worker_id")
+  attempt     Int
+  status      ExecutionStatus
+  startedAt   DateTime        @map("started_at")
+  finishedAt  DateTime?       @map("finished_at")
+  durationMs  Int?            @map("duration_ms")
+  error       String?
+  errorStack  String?         @map("error_stack")
+  result      Json?
+  memoryUsage Int?            @map("memory_usage_bytes")
+
+  job    Job    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@index([workerId])
+  @@index([startedAt])
+  @@map("job_executions")
+}
+
+// ─── Job Logs ─────────────────────────────────────────────────────────────────
+// Purpose: Per-job structured log lines emitted during execution.
+
+model JobLog {
+  id        String   @id @default(uuid())
+  jobId     String   @map("job_id")
+  level     LogLevel @default(INFO)
+  message   String
+  meta      Json?
+  timestamp DateTime @default(now())
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId, timestamp])
+  @@map("job_logs")
+}
+
+// ─── Scheduled Jobs ───────────────────────────────────────────────────────────
+// Purpose: Tracks next-run time for recurring cron jobs.
+
+model ScheduledJob {
+  id             String    @id @default(uuid())
+  jobTemplateId  String    @map("job_template_id")   // template job id
+  queueId        String    @map("queue_id")
+  cronExpression String    @map("cron_expression")
+  name           String
+  payload        Json      @default("{}")
+  maxAttempts    Int       @default(3)  @map("max_attempts")
+  priority       Int       @default(0)
+  timeout        Int?
+  isActive       Boolean   @default(true) @map("is_active")
+  lastRunAt      DateTime? @map("last_run_at")
+  nextRunAt      DateTime  @map("next_run_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt      @map("updated_at")
+
+  @@index([nextRunAt, isActive])
+  @@index([queueId])
+  @@map("scheduled_jobs")
+}
+
+// ─── Workers ──────────────────────────────────────────────────────────────────
+// Purpose: Registry of active worker processes.
+
+model Worker {
+  id           String       @id @default(uuid())
+  hostname     String
+  pid          Int
+  status       WorkerStatus @default(IDLE)
+  concurrency  Int          @default(5)
+  activeJobs   Int          @default(0)  @map("active_jobs")
+  totalJobsDone Int         @default(0)  @map("total_jobs_done")
+  queues       String[]     // queue IDs this worker subscribes to
+  version      String?
+  startedAt    DateTime     @map("started_at")
+  lastSeenAt   DateTime     @map("last_seen_at")
+  createdAt    DateTime     @default(now()) @map("created_at")
+
+  executions    JobExecution[]
+  heartbeats    WorkerHeartbeat[]
+
+  @@index([status])
+  @@index([lastSeenAt])
+  @@map("workers")
+}
+
+// ─── Worker Heartbeats ────────────────────────────────────────────────────────
+// Purpose: Time-series heartbeat pings for worker liveness tracking.
+
+model WorkerHeartbeat {
+  id          String   @id @default(uuid())
+  workerId    String   @map("worker_id")
+  activeJobs  Int      @map("active_jobs")
+  memoryUsage Int?     @map("memory_usage_bytes")
+  cpuUsage    Float?   @map("cpu_usage_percent")
+  timestamp   DateTime @default(now())
+
+  worker Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  @@index([workerId, timestamp])
+  @@map("worker_heartbeats")
+}
+
+// ─── Dead Letter Queue ────────────────────────────────────────────────────────
+// Purpose: Permanent failure vault for exhausted jobs.
+
+model DLQEntry {
+  id           String   @id @default(uuid())
+  jobId        String   @unique @map("job_id")
+  queueId      String   @map("queue_id")
+  reason       String
+  lastError    String   @map("last_error")
+  attempts     Int
+  payload      Json
+  failedAt     DateTime @default(now()) @map("failed_at")
+  replayedAt   DateTime? @map("replayed_at")
+  replayJobId  String?   @map("replay_job_id")
+  aiSummary    String?   @map("ai_summary")       // AI failure analysis
+
+  job Job @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([queueId])
+  @@index([failedAt])
+  @@map("dlq_entries")
+}
+
+// ─── Distributed Locks ────────────────────────────────────────────────────────
+// Purpose: Advisory locks for distributed coordination (scheduler, claiming).
+
+model DistributedLock {
+  key       String   @id
+  holder    String
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([expiresAt])
+  @@map("distributed_locks")
+}
