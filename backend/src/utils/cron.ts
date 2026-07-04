@@ -1,4 +1,4 @@
-import nodeCron from 'node-cron';
+import * as nodeCron from 'node-cron';
 
 export function isValidCron(expression: string): boolean {
   return nodeCron.validate(expression);

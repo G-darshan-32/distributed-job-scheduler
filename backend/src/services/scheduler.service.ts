@@ -1,4 +1,4 @@
-import cron from 'node-cron';
+import * as cron from 'node-cron';
 import { JobStatus, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { broadcast } from '../lib/websocket';
